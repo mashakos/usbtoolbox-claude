@@ -93,7 +93,7 @@ jobs:
           exe=usbdump-src/build/bin/Release/usbdump.exe
           "$exe" --version
           "$exe" --debug > usbdump-out.json 2> usbdump-debug.txt
-          python -c "import json; d = json.load(open('usbdump-out.json')); print('controllers:', len(d))"
+          python -c "import json; d = json.load(open('usbdump-out.json')) or []; print('controllers:', len(d))"
           cat usbdump-debug.txt
 
       - uses: actions/upload-artifact@v4

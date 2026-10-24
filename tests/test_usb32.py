@@ -74,6 +74,12 @@ def test_controller_serialization():
     assert "Broken" in reasons
 
 
+def test_no_controllers():
+    for payload in (b"null", b"[]"):  # usbdump prints null on machines without host controllers
+        with mock.patch.object(usbdump.subprocess, "run", return_value=mock.Mock(stdout=payload)):
+            assert usbdump.get_controllers() == []
+
+
 def test_is_same_controller():
     B = base.BaseUSBMap
     assert B.is_same_controller({"identifiers": {"instance_id": "X"}}, {"identifiers": {"instance_id": "X"}}) is False

@@ -1,22 +1,17 @@
-From a26c1baf0ffdf23513776097c5f7043860c1e343 Mon Sep 17 00:00:00 2001
+From d10f7cbb2b65a926387efed9feae4ea5d2314434 Mon Sep 17 00:00:00 2001
 From: usb32 <usb32@example.invalid>
-Date: Fri, 23 Oct 2026 22:48:44 +0000
+Date: Sat, 24 Oct 2026 00:46:35 +0000
 Subject: [PATCH] Don't lose USB 3.20 xHCI controllers; harden controller
  enumeration
 
-- usbdump.py: tolerate null HubInfo/UsbDeviceProperties/PCI ids, isolate per-controller
-  failures and record skipped controllers instead of dropping them silently
-- Windows.py: don't crash on unknown PCI ProgIf, escape WQL instance IDs, guard empty IDs
-- base.py: show controllers that could not be enumerated; never treat two controllers as
-  the same based only on instance_id/location_id
 ---
- Scripts/usbdump.py | 90 +++++++++++++++++++++++++++++++---------------
- Windows.py         | 17 +++++++--
- base.py            | 15 ++++++--
- 3 files changed, 90 insertions(+), 32 deletions(-)
+ Scripts/usbdump.py | 93 +++++++++++++++++++++++++++++++---------------
+ Windows.py         | 17 ++++++++-
+ base.py            | 15 +++++++-
+ 3 files changed, 92 insertions(+), 33 deletions(-)
 
 diff --git a/Scripts/usbdump.py b/Scripts/usbdump.py
-index ed85a4e..da1e058 100644
+index ed85a4e..f796d7d 100644
 --- a/Scripts/usbdump.py
 +++ b/Scripts/usbdump.py
 @@ -133,17 +133,26 @@ def guess_ports():
@@ -97,12 +92,15 @@ index ed85a4e..da1e058 100644
  
      usbdump_path = Path("resources/usbdump.exe")
  
-@@ -214,34 +263,19 @@ def get_controllers():
+@@ -213,35 +262,21 @@ def get_controllers():
+         usbdump_path = Path(sys._MEIPASS) / usbdump_path
  
      info = json.load(shared.debug_dump_path.open())["usbdump"] if shared.test_mode else json.loads(subprocess.run(usbdump_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode())
-     for controller in info:
+-    for controller in info:
 -        if not controller["RootHub"]:
 -            # This is useless
++    # usbdump prints `null` (not `[]`) on machines with no host controllers, e.g. VMs
++    for controller in info or []:
 +        if not controller.get("RootHub"):
 +            # Nothing we can map without a root hub, but don't hide that the controller exists
 +            # (this is what happened with Intel(R) USB 3.20 eXtensible Host Controller when its root hub could not be opened)
