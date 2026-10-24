@@ -1,0 +1,242 @@
+name: Build USBToolBox (Intel USB 3.20 xHCI support)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Upstream revisions the patches in ./patches were written against.
+  TOOL_REPO: USBToolBox/tool
+  TOOL_REF: 0c6823a2c643a4488888938451194723dc9ae29a
+  USBDUMP_REPO: USBToolBox/usbdump
+  USBDUMP_REF: 51adc70f8f9f763f24bf90b94104ca754aa49b27
+  # The upstream .spec files pass `cipher=` to PyInstaller, which PyInstaller 6 removed. Stay on 5.x.
+  PYTHON_VERSION: "3.11"
+  PYINSTALLER_VERSION: "5.13.2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Fast cross-platform check: patches apply cleanly and the Python logic works
+  # ---------------------------------------------------------------------------
+  test:
+    name: Patches apply + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out upstream tool
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.TOOL_REPO }}
+          ref: ${{ env.TOOL_REF }}
+          path: tool
+
+      - name: Check out upstream usbdump (patch apply check only)
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.USBDUMP_REPO }}
+          ref: ${{ env.USBDUMP_REF }}
+          path: usbdump-src
+
+      - name: Apply patches
+        run: |
+          git -C tool apply --whitespace=nowarn "$GITHUB_WORKSPACE"/patches/0001-*.patch
+          git -C usbdump-src apply --whitespace=nowarn "$GITHUB_WORKSPACE"/patches/usbdump-0001-*.patch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install termcolor2 "ansiescapes @ git+https://github.com/embedded-dev/ansiescapes.git"
+
+      - name: Run tests
+        run: TOOL_DIR="$GITHUB_WORKSPACE/tool" python tests/test_usb32.py
+
+  # ---------------------------------------------------------------------------
+  # usbdump.exe (C++): the helper that actually enumerates host controllers
+  # ---------------------------------------------------------------------------
+  usbdump:
+    name: Build usbdump.exe (patched)
+    runs-on: windows-2022 # pinned: the CMake generator below is "Visual Studio 17 2022"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out upstream usbdump
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.USBDUMP_REPO }}
+          ref: ${{ env.USBDUMP_REF }}
+          path: usbdump-src
+
+      - name: Apply patch
+        shell: bash
+        run: git -C usbdump-src apply --whitespace=nowarn "$GITHUB_WORKSPACE"/patches/usbdump-0001-*.patch
+
+      - name: Configure
+        shell: bash
+        run: cmake -S usbdump-src -B usbdump-src/build -G "Visual Studio 17 2022" -A x64 -T host=x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash
+        run: cmake --build usbdump-src/build --config Release
+
+      - name: Smoke test (stdout must stay valid JSON even with --debug)
+        shell: bash
+        run: |
+          exe=usbdump-src/build/bin/Release/usbdump.exe
+          "$exe" --version
+          "$exe" --debug > usbdump-out.json 2> usbdump-debug.txt
+          python -c "import json; d = json.load(open('usbdump-out.json')); print('controllers:', len(d))"
+          cat usbdump-debug.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usbdump-x64
+          path: usbdump-src/build/bin/Release/usbdump.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # USBToolBox for Windows
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Build Windows
+    needs: [test, usbdump]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out upstream tool
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.TOOL_REPO }}
+          ref: ${{ env.TOOL_REF }}
+          path: tool
+          fetch-depth: 0 # so `git describe` can stamp the build
+
+      - name: Apply patch
+        shell: bash
+        run: git -C tool apply --whitespace=nowarn "$GITHUB_WORKSPACE"/patches/0001-*.patch
+
+      - name: Use the patched usbdump.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: usbdump-x64
+          path: tool/resources
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        shell: bash
+        working-directory: tool
+        run: pip install -r requirements.txt "pyinstaller==${PYINSTALLER_VERSION}"
+
+      - name: Build
+        shell: bash
+        working-directory: tool
+        run: |
+          pyinstaller spec/Windows.spec
+          pyinstaller spec/Windows_dir.spec
+          pyinstaller spec/debug_dump.spec
+          pyinstaller spec/debug_dump_dir.spec
+
+      - name: Zip
+        shell: pwsh
+        working-directory: tool
+        run: |
+          Compress-Archive -Path dist/Windows/* -DestinationPath dist/Windows.zip
+          Compress-Archive -Path dist/debug_dump/* -DestinationPath dist/debug_dump.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: USBToolBox-Windows
+          path: |
+            tool/dist/*.exe
+            tool/dist/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # USBToolBox for macOS (Apple Silicon + Intel)
+  # ---------------------------------------------------------------------------
+  macos:
+    name: Build macOS (${{ matrix.arch }})
+    needs: [test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out upstream tool
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.TOOL_REPO }}
+          ref: ${{ env.TOOL_REF }}
+          path: tool
+          fetch-depth: 0
+
+      - name: Apply patch
+        run: git -C tool apply --whitespace=nowarn "$GITHUB_WORKSPACE"/patches/0001-*.patch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        working-directory: tool
+        run: pip install -r requirements.txt "pyinstaller==${PYINSTALLER_VERSION}"
+
+      - name: Build
+        working-directory: tool
+        run: pyinstaller spec/macOS.spec
+
+      - name: Verify binary architecture
+        working-directory: tool
+        run: |
+          file dist/macOS
+          file dist/macOS | grep -q "${{ matrix.arch }}"
+
+      - name: Zip
+        working-directory: tool/dist
+        run: zip "macOS-${{ matrix.arch }}.zip" macOS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: USBToolBox-macOS-${{ matrix.arch }}
+          path: tool/dist/macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish on tag push (v*)
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

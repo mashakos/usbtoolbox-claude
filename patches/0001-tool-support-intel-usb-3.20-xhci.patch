@@ -1,0 +1,246 @@
+From a26c1baf0ffdf23513776097c5f7043860c1e343 Mon Sep 17 00:00:00 2001
+From: usb32 <usb32@example.invalid>
+Date: Fri, 23 Oct 2026 22:48:44 +0000
+Subject: [PATCH] Don't lose USB 3.20 xHCI controllers; harden controller
+ enumeration
+
+- usbdump.py: tolerate null HubInfo/UsbDeviceProperties/PCI ids, isolate per-controller
+  failures and record skipped controllers instead of dropping them silently
+- Windows.py: don't crash on unknown PCI ProgIf, escape WQL instance IDs, guard empty IDs
+- base.py: show controllers that could not be enumerated; never treat two controllers as
+  the same based only on instance_id/location_id
+---
+ Scripts/usbdump.py | 90 +++++++++++++++++++++++++++++++---------------
+ Windows.py         | 17 +++++++--
+ base.py            | 15 ++++++--
+ 3 files changed, 90 insertions(+), 32 deletions(-)
+
+diff --git a/Scripts/usbdump.py b/Scripts/usbdump.py
+index ed85a4e..da1e058 100644
+--- a/Scripts/usbdump.py
++++ b/Scripts/usbdump.py
+@@ -133,17 +133,26 @@ def guess_ports():
+                 port["guessed"] = shared.USBPhysicalPortTypes.USBTypeA
+ 
+ 
++def _nested_get(obj, *keys, default=None):
++    for key in keys:
++        if not isinstance(obj, dict):
++            return default
++        obj = obj.get(key)
++    return default if obj is None else obj
++
++
+ def serialize_hub(hub):
++    hub_ports = hub.get("HubPorts")
+     hub_info = {
+         "hub_name": hub["HubName"],
+         # "class": get_hub_type(hub),
+-        "port_count": hub["HubInfo"]["HubInformation"]["HubDescriptor"]["bNumberOfPorts"],
++        # HubInfo can be null on some drivers (e.g. USB 3.20 xHCI root hubs); fall back to what we actually enumerated
++        "port_count": _nested_get(hub, "HubInfo", "HubInformation", "HubDescriptor", "bNumberOfPorts", default=len(hub_ports or [])),
+         # "highest_port_number": hub["HubInfoEx"]["HighestPortNumber"],
+         "ports": [],
+     }
+ 
+     # HubPorts
+-    hub_ports = hub["HubPorts"]
+     if hub_ports:  # For some reason, this is sometimes null? Botched driver?
+         for i, port in enumerate(hub_ports):
+             if not port:
+@@ -204,8 +213,48 @@ def serialize_hub(hub):
+     return hub_info
+ 
+ 
++skipped_controllers = []
++
++
++def _controller_label(controller):
++    props = controller.get("UsbDeviceProperties") or {}
++    return props.get("DeviceDesc") or props.get("DeviceId") or "Unknown USB host controller"
++
++
++def serialize_controller(controller):
++    props = controller.get("UsbDeviceProperties") or {}
++
++    # root
++    controller_info = {
++        "name": props.get("DeviceDesc") or "Unknown USB host controller",
++        "identifiers": {
++            "instance_id": props.get("DeviceId"),
++            # "revision": controller["Revision"],
++        },
++        # "port_count_no3": controller["ControllerInfo"]["NumberOfRootPorts"],
++        "class": "",
++    } | serialize_hub(controller["RootHub"])
++
++    vendor_id, device_id = controller.get("VendorID") or 0, controller.get("DeviceID") or 0
++    if all(i not in [0, int("0xFFFF", 16)] for i in [vendor_id, device_id]):
++        controller_info["identifiers"]["pci_id"] = [hex(vendor_id)[2:], hex(device_id)[2:]]
++
++        subsys_id = controller.get("SubSysID") or 0
++        if subsys_id not in [0, int("0xFFFFFFFF", 16)]:
++            controller_info["identifiers"]["pci_id"] += [hex(subsys_id)[2:6], hex(subsys_id)[6:]]
++
++    if (controller.get("ControllerInfo") or {}).get("PciRevision", 0) not in [0, int("0xFF", 16)]:
++        controller_info["identifiers"]["pci_revision"] = int(controller["ControllerInfo"]["PciRevision"])
++
++    if controller.get("BusDeviceFunctionValid"):
++        controller_info["identifiers"]["bdf"] = [controller["BusNumber"], controller["BusDevice"], controller["BusFunction"]]
++
++    return controller_info
++
++
+ def get_controllers():
+     new_info = []
++    skipped_controllers.clear()
+ 
+     usbdump_path = Path("resources/usbdump.exe")
+ 
+@@ -214,34 +263,19 @@ def get_controllers():
+ 
+     info = json.load(shared.debug_dump_path.open())["usbdump"] if shared.test_mode else json.loads(subprocess.run(usbdump_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode())
+     for controller in info:
+-        if not controller["RootHub"]:
+-            # This is useless
++        if not controller.get("RootHub"):
++            # Nothing we can map without a root hub, but don't hide that the controller exists
++            # (this is what happened with Intel(R) USB 3.20 eXtensible Host Controller when its root hub could not be opened)
++            skipped_controllers.append((_controller_label(controller), "root hub could not be read"))
++            shared.debug(f"Skipping {_controller_label(controller)}: usbdump returned no root hub")
+             continue
+ 
+-        # root
+-        controller_info = {
+-            "name": controller["UsbDeviceProperties"]["DeviceDesc"],
+-            "identifiers": {
+-                "instance_id": controller["UsbDeviceProperties"]["DeviceId"],
+-                # "revision": controller["Revision"],
+-            },
+-            # "port_count_no3": controller["ControllerInfo"]["NumberOfRootPorts"],
+-            "class": "",
+-        } | serialize_hub(controller["RootHub"])
+-
+-        if all(controller[i] not in [0, int("0xFFFF", 16)] for i in ["VendorID", "DeviceID"]):
+-            controller_info["identifiers"]["pci_id"] = [hex(controller[i])[2:] for i in ["VendorID", "DeviceID"]]
+-
+-        if controller["SubSysID"] not in [0, int("0xFFFFFFFF", 16)]:
+-            controller_info["identifiers"]["pci_id"] += [hex(controller["SubSysID"])[2:6], hex(controller["SubSysID"])[6:]]
+-
+-        if (controller.get("ControllerInfo") or {}).get("PciRevision", 0) not in [0, int("0xFF", 16)]:
+-            controller_info["identifiers"]["pci_revision"] = int(controller["ControllerInfo"]["PciRevision"])
+-
+-        if controller["BusDeviceFunctionValid"]:
+-            controller_info["identifiers"]["bdf"] = [controller["BusNumber"], controller["BusDevice"], controller["BusFunction"]]
+-
+-        new_info.append(controller_info)
++        try:
++            new_info.append(serialize_controller(controller))
++        except Exception as e:  # pylint: disable=broad-except
++            # One malformed controller must not take every other controller down with it
++            skipped_controllers.append((_controller_label(controller), f"{type(e).__name__}: {e}"))
++            shared.debug(f"Failed to serialize {_controller_label(controller)}: {type(e).__name__}: {e}")
+     guess_ports()
+     if False:
+         for hub in hub_map:
+diff --git a/Windows.py b/Windows.py
+index 54ae44b..9e08bf2 100644
+--- a/Windows.py
++++ b/Windows.py
+@@ -45,16 +45,24 @@ class WindowsUSBMap(BaseUSBMap):
+     def update_usbdump(self):
+         self.usbdump = usbdump.get_controllers()
+ 
++    @staticmethod
++    def escape_wql(value: str) -> str:
++        # Backslashes and quotes are escape characters in WQL string literals; instance IDs are full of backslashes
++        return value.replace("\\", "\\\\").replace("'", "\\'")
++
+     def get_property_from_wmi(self, instance_id, prop: PnpDeviceProperties):
+         MAX_TRIES = 2
+         result = None
++
++        if not instance_id:
++            return None
+         if self.wmi_cache.get(instance_id, {}).get(prop.value):
+             return self.wmi_cache[instance_id][prop.value]
+         elif self.wmi_retries.get(instance_id, {}).get(prop.value, 0) >= MAX_TRIES:
+             return None
+ 
+         try:
+-            result = self.wmi.query(f"SELECT * FROM Win32_PnPEntity WHERE PNPDeviceID = '{instance_id}'")[0].GetDeviceProperties([prop.value])[0][0].Data
++            result = self.wmi.query(f"SELECT * FROM Win32_PnPEntity WHERE PNPDeviceID = '{self.escape_wql(instance_id)}'")[0].GetDeviceProperties([prop.value])[0][0].Data
+         except IndexError:
+             # Race condition between unplug detected in usbdump and WMI
+             return None
+@@ -97,7 +105,11 @@ class WindowsUSBMap(BaseUSBMap):
+     def get_controller_class(self, controller):
+         interface = self.get_property_from_wmi(controller["identifiers"]["instance_id"], PnpDeviceProperties.INTERFACE)
+         if interface:
+-            return shared.USBControllerTypes(interface)
++            try:
++                return shared.USBControllerTypes(interface)
++            except ValueError:
++                # Unknown PCI programming interface; fall back to matching on the driver service below
++                shared.debug(f"Unknown PCI ProgIf {interface!r} for {controller['name']}, falling back to service")
+         service = self.get_property_from_wmi(controller["identifiers"]["instance_id"], PnpDeviceProperties.SERVICE)
+         if not isinstance(service, str):
+             shared.debug(f"Unknown controller type for interface {interface} and service {service}!")
+@@ -148,6 +160,7 @@ class WindowsUSBMap(BaseUSBMap):
+                     self.get_name_from_wmi(device)
+ 
+         self.controllers = controllers
++        self.skipped_controllers = list(usbdump.skipped_controllers)
+         if not self.controllers_historical:
+             self.controllers_historical = copy.deepcopy(self.controllers)
+         else:
+diff --git a/base.py b/base.py
+index 65b6312..e40843a 100644
+--- a/base.py
++++ b/base.py
+@@ -38,6 +38,7 @@ class BaseUSBMap:
+     def __init__(self):
+         self.utils = utils.Utils(f"USBToolBox {shared.VERSION}".strip())
+         self.controllers = None
++        self.skipped_controllers = []
+         self.json_path = shared.current_dir / Path("usb.json")
+         self.settings_path = shared.current_dir / Path("settings.json")
+ 
+@@ -51,8 +52,9 @@ class BaseUSBMap:
+     @staticmethod
+     def is_same_controller(controller_1, controller_2):
+         common_keys: set[str] = set(i for i in controller_1["identifiers"] if controller_1["identifiers"][i]) & set(i for i in controller_2["identifiers"] if controller_2["identifiers"][i])
+-        if not common_keys:
+-            # No way to tell
++        if not common_keys - {"instance_id", "location_id"}:
++            # No way to tell. instance_id/location_id are ignored below (they change on hotplug), so matching on them alone
++            # would wrongly merge unrelated controllers into one and make one of them vanish.
+             return False
+         for key in common_keys:
+             if key in ["instance_id", "location_id"]:
+@@ -212,6 +214,14 @@ class BaseUSBMap:
+             for i in device["devices"]:
+                 self.print_devices(i, indentation + "  ")
+ 
++    def print_skipped_controllers(self):
++        if not self.skipped_controllers:
++            return
++        print()
++        print("The following controllers were found but could not be enumerated:")
++        for name, reason in self.skipped_controllers:
++            print(f"  - {name} ({reason})")
++
+     def discover_ports(self):
+         self.utils.head("Port Discovery")
+         print()
+@@ -230,6 +240,7 @@ class BaseUSBMap:
+                 self.update_devices()
+ 
+             self.print_controllers(self.controllers, colored=True)
++            self.print_skipped_controllers()
+ 
+             self.dump_historical()
+             print("\nB.  Back\n")
+-- 
+2.43.0
+

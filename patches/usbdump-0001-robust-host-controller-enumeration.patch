@@ -1,0 +1,324 @@
+From 95e66620404db730538738d36580d3cc958f44fa Mon Sep 17 00:00:00 2001
+From: usb32 <usb32@example.invalid>
+Date: Fri, 23 Oct 2026 22:51:19 +0000
+Subject: [PATCH] Make host controller enumeration robust; add --debug
+ diagnostics
+
+- Walk device interfaces instead of device infos and continue on per-controller errors
+  (previously the first failure aborted enumeration and dropped every later controller)
+- Use the SP_DEVINFO_DATA belonging to each interface for bus/device/function
+- Fall back to more permissive CreateFile access/share modes for HCD and hub handles
+- Add --debug / USBDUMP_DEBUG=1 to log every step that fails to stderr
+---
+ enum.cpp    | 116 +++++++++++++++++++++++++++++++++++++++-------------
+ usbdump.cpp |  25 +++++++++++
+ uvcview.h   |   4 ++
+ 3 files changed, 117 insertions(+), 28 deletions(-)
+
+diff --git a/enum.cpp b/enum.cpp
+index e448b33..8251c9a 100644
+--- a/enum.cpp
++++ b/enum.cpp
+@@ -73,6 +73,44 @@ Revision History:
+ 
+ #define NUM_STRING_DESC_TO_GET 32
+ 
++//*****************************************************************************
++//
++// OpenUsbDevice()
++//
++// Opens a host controller / hub device. The first attempt is identical to what
++// USBView does. If it fails (e.g. the Microsoft inbox xHCI driver on newer
++// Intel controllers such as "USB 3.20 eXtensible Host Controller" refusing the
++// requested access or share mode), retry with more permissive sharing and then
++// with no access rights at all: every USB IOCTL we use is FILE_ANY_ACCESS.
++//
++//*****************************************************************************
++static HANDLE
++OpenUsbDevice (
++    _In_z_ const WCHAR *path
++)
++{
++    HANDLE h = CreateFile(path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++    if (h != INVALID_HANDLE_VALUE)
++    {
++        return h;
++    }
++    UsbdumpLog(L"CreateFile(GENERIC_WRITE) failed for %s", path);
++
++    h = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++    if (h != INVALID_HANDLE_VALUE)
++    {
++        return h;
++    }
++    UsbdumpLog(L"CreateFile(GENERIC_READ|GENERIC_WRITE, share rw) failed for %s", path);
++
++    h = CreateFile(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++    if (h == INVALID_HANDLE_VALUE)
++    {
++        UsbdumpLog(L"CreateFile(no access) failed for %s", path);
++    }
++    return h;
++}
++
+ //*****************************************************************************
+ // L O C A L    F U N C T I O N    P R O T O T Y P E S
+ //*****************************************************************************
+@@ -263,77 +301,93 @@ EnumerateHostControllers (
+ 
+     EnumerateAllDevices();
+ 
+-    // Iterate over host controllers using the new GUID based interface
++    // Iterate over host controllers using the new GUID based interface.
++    //
++    // Walk the *device interfaces* (not the device infos): the two lists are not
++    // guaranteed to line up one-to-one (virtual controllers such as VirtualHere
++    // or devices with several interfaces break that), and the original code
++    // stopped the whole enumeration at the first error, silently losing every
++    // controller after it. A failure on one controller now only skips that one.
+     //
+     deviceInfo = SetupDiGetClassDevs((LPGUID)&GUID_CLASS_USB_HOST_CONTROLLER,
+                                      NULL,
+                                      NULL,
+                                      (DIGCF_PRESENT | DIGCF_DEVICEINTERFACE));
+ 
+-    deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
++    if (deviceInfo == INVALID_HANDLE_VALUE)
++    {
++        UsbdumpLog(L"SetupDiGetClassDevs(GUID_CLASS_USB_HOST_CONTROLLER) failed");
++        *DevicesConnected = 0;
++        return hostControllers;
++    }
+ 
+-    for (index=0;
+-         SetupDiEnumDeviceInfo(deviceInfo,
+-                               index,
+-                               &deviceInfoData);
+-         index++)
++    for (index = 0; ; index++)
+     {
+         deviceInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+ 
+         success = SetupDiEnumDeviceInterfaces(deviceInfo,
+-                                              0,
++                                              NULL,
+                                               (LPGUID)&GUID_CLASS_USB_HOST_CONTROLLER,
+                                               index,
+                                               &deviceInterfaceData);
+ 
+         if (!success)
+         {
+-            OOPS();
++            if (GetLastError() != ERROR_NO_MORE_ITEMS)
++            {
++                UsbdumpLog(L"SetupDiEnumDeviceInterfaces failed at index %lu", index);
++            }
+             break;
+         }
+ 
++        // Also fetch the SP_DEVINFO_DATA that belongs to *this* interface
++        // (used for bus/device/function below).
++        //
++        requiredLength = 0;
++        deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
++
+         success = SetupDiGetDeviceInterfaceDetail(deviceInfo,
+                                                   &deviceInterfaceData,
+                                                   NULL,
+                                                   0,
+                                                   &requiredLength,
+-                                                  NULL);
++                                                  &deviceInfoData);
+ 
+         if (!success && GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+         {
+             OOPS();
+-            break;
++            UsbdumpLog(L"SetupDiGetDeviceInterfaceDetail(size) failed for host controller %lu", index);
++            continue;
+         }
+ 
+         deviceDetailData = (PSP_DEVICE_INTERFACE_DETAIL_DATA)ALLOC(requiredLength);
+         if (deviceDetailData == NULL)
+         {
+             OOPS();
+-            break;
++            continue;
+         }
+ 
+         deviceDetailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
++        deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+ 
+         success = SetupDiGetDeviceInterfaceDetail(deviceInfo,
+                                                   &deviceInterfaceData,
+                                                   deviceDetailData,
+                                                   requiredLength,
+                                                   &requiredLength,
+-                                                  NULL);
++                                                  &deviceInfoData);
+ 
+         if (!success)
+         {
+             OOPS();
+-            break;
++            UsbdumpLog(L"SetupDiGetDeviceInterfaceDetail failed for host controller %lu", index);
++            FREE(deviceDetailData);
++            continue;
+         }
+ 
+-        hHCDev = CreateFile(deviceDetailData->DevicePath,
+-                            GENERIC_WRITE,
+-                            FILE_SHARE_WRITE,
+-                            NULL,
+-                            OPEN_EXISTING,
+-                            0,
+-                            NULL);
++        UsbdumpLog(L"Host controller %lu: %s", index, deviceDetailData->DevicePath);
++
++        hHCDev = OpenUsbDevice(deviceDetailData->DevicePath);
+ 
+         // If the handle is valid, then we've successfully opened a Host
+         // Controller.  Display some info about the Host Controller itself,
+@@ -348,6 +402,8 @@ EnumerateHostControllers (
+                                     &deviceInfoData);
+             if (info) {
+                 hostControllers.push_back(info);
++            } else {
++                UsbdumpLog(L"Host controller %lu was not enumerated (see previous messages)", index);
+             }
+ 
+             CloseHandle(hHCDev);
+@@ -408,6 +464,7 @@ EnumerateHostController (
+     {
+         // Failure obtaining driver key name.
+         OOPS();
++        UsbdumpLog(L"IOCTL_GET_HCD_DRIVERKEY_NAME failed for %s", leafName);
+         FREE(hcInfo);
+         return NULL;
+     }
+@@ -421,6 +478,7 @@ EnumerateHostController (
+         {
+             // Already on the list, exit
+             //
++            UsbdumpLog(L"Skipping duplicate host controller (driver key %s)", driverKeyName);
+             FREE(driverKeyName);
+             FREE(hcInfo);
+             return NULL;
+@@ -576,6 +634,12 @@ EnumerateHostController (
+         // Failure obtaining root hub name.
+ 
+         OOPS();
++        UsbdumpLog(L"IOCTL_USB_GET_ROOT_HUB_NAME failed for host controller %s", driverKeyName);
++    }
++
++    if (hcInfo->RootHub == NULL)
++    {
++        UsbdumpLog(L"Host controller %s has no usable root hub; it will be reported without ports", driverKeyName);
+     }
+ 
+     return hcInfo;
+@@ -739,13 +803,7 @@ EnumerateHub (
+ 
+     // Try to hub the open device
+     //
+-    hHubDevice = CreateFile(deviceName,
+-                            GENERIC_WRITE,
+-                            FILE_SHARE_WRITE,
+-                            NULL,
+-                            OPEN_EXISTING,
+-                            0,
+-                            NULL);
++    hHubDevice = OpenUsbDevice(deviceName);
+ 
+     // Done with temp buffer for full hub device name
+     //
+@@ -754,6 +812,7 @@ EnumerateHub (
+     if (hHubDevice == INVALID_HANDLE_VALUE)
+     {
+         OOPS();
++        UsbdumpLog(L"Could not open hub %s", HubName);
+         goto EnumerateHubError;
+     }
+ 
+@@ -774,6 +833,7 @@ EnumerateHub (
+     if (!success)
+     {
+         OOPS();
++        UsbdumpLog(L"IOCTL_USB_GET_NODE_INFORMATION failed for hub %s", HubName);
+         goto EnumerateHubError;
+     }
+ 
+diff --git a/usbdump.cpp b/usbdump.cpp
+index 5697ba0..0df957c 100644
+--- a/usbdump.cpp
++++ b/usbdump.cpp
+@@ -2,10 +2,29 @@
+ //
+ 
+ #include "usbdump.h"
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
+ 
+ using namespace std;
+ using json = nlohmann::json;
+ 
++bool gVerbose = false;
++
++void UsbdumpLog(const wchar_t* format, ...) {
++    if (!gVerbose) {
++        return;
++    }
++    DWORD lastError = GetLastError();
++    fwprintf(stderr, L"[usbdump] ");
++    va_list args;
++    va_start(args, format);
++    vfwprintf(stderr, format, args);
++    va_end(args);
++    fwprintf(stderr, L" (GetLastError=%lu)\n", lastError);
++    SetLastError(lastError);
++}
++
+ void initGlobals() {
+     gHubList.DeviceInfo = INVALID_HANDLE_VALUE;
+     InitializeListHead(&gHubList.ListHead);
+@@ -19,15 +38,21 @@ int main(int argc, char* argv[]) {
+             std::cout << "usbdump " TOOL_VERSION << std::endl;
+             std::cout << "Built on " __DATE__ " " __TIME__ << std::endl;
+             return 0;
++        } else if (std::string(argv[1]) == "--debug" || std::string(argv[1]) == "-d") {
++            gVerbose = true;
+         } else {
+             return 1;
+         }
+     }
++    if (getenv("USBDUMP_DEBUG") != nullptr) {
++        gVerbose = true;
++    }
+     initGlobals();
+ 
+     ULONG devicesConnected;
+ 
+     std::vector<USBHOSTCONTROLLERINFO*> hostControllers = EnumerateHostControllers((HTREEITEM)1, &devicesConnected);
++    UsbdumpLog(L"Enumerated %zu host controller(s)", hostControllers.size());
+     json ree = hostControllers;
+     std::cout << ree.dump(4) << std::endl;
+     /* for (const auto& hostController : hostControllers) {
+diff --git a/uvcview.h b/uvcview.h
+index f3280ee..0212636 100644
+--- a/uvcview.h
++++ b/uvcview.h
+@@ -80,6 +80,10 @@ Revision History:
+ #define DBG 1
+ #endif
+ 
++// Runtime diagnostics (enabled with `usbdump --debug` or USBDUMP_DEBUG=1). Written to stderr so the JSON on stdout stays valid.
++extern bool gVerbose;
++void UsbdumpLog(_In_z_ const wchar_t* format, ...);
++
+ #if DBG
+ #define OOPS() Oops(__FILE__, __LINE__)
+ #else
+-- 
+2.43.0
+
